@@ -228,7 +228,8 @@ typeOf (Apply x t t') = do
                 else throwError (TypeMismatch x (void t') ty' ty''')
         _ -> throwError (TypeMismatch x (void t) (TyFun () dummyType dummyType) ty)
 typeOf (TyInst x t ty) = do
-    ty' <- typeOf t
+    (red, _) <- ask
+    ty' <- maybeReduce red <$> typeOf t
     case ty' of
         TyForall _ n k ty'' -> do
             k' <- kindOf ty
