@@ -30,7 +30,7 @@ data BuiltinTable = BuiltinTable (M.Map TypeBuiltin (Kind ())) (M.Map BuiltinNam
 
 -- | The type checking monad contains the 'BuiltinTable' and it lets us throw
 -- 'TypeError's.
-type TypeCheckM a = StateT Natural (ReaderT BuiltinTable (Either (TypeError a)))
+type TypeCheckM a = StateT Natural (ReaderT (Bool, BuiltinTable) (Either (TypeError a)))
 
 isType :: Kind a -> Bool
 isType Type{} = True
@@ -101,25 +101,26 @@ defaultTable = do
     pure $ BuiltinTable tyTable termTable
 
 -- | Type-check a PLC program.
-typecheckProgram :: (MonadError (Error a) m, MonadQuote m) => Natural -> Program TyNameWithKind NameWithType a -> m (Type TyNameWithKind ())
-typecheckProgram n (Program _ _ t) = typecheckTerm n t
+typecheckProgram :: (MonadError (Error a) m, MonadQuote m) => Natural -> Bool -> Program TyNameWithKind NameWithType a -> m (Type TyNameWithKind ())
+typecheckProgram n b (Program _ _ t) = typecheckTerm n b t
 
 -- | Type-check a PLC term.
-typecheckTerm :: (MonadError (Error a) m, MonadQuote m) => Natural -> Term TyNameWithKind NameWithType a -> m (Type TyNameWithKind ())
-typecheckTerm n t = convertErrors asError $ runTypeCheckM n (typeOf t)
+typecheckTerm :: (MonadError (Error a) m, MonadQuote m) => Natural -> Bool -> Term TyNameWithKind NameWithType a -> m (Type TyNameWithKind ())
+typecheckTerm n b t = convertErrors asError $ runTypeCheckM n b (typeOf t)
 
 -- | Kind-check a PLC term.
 kindCheck :: (MonadError (Error a) m, MonadQuote m) => Natural -> Type TyNameWithKind a -> m (Kind ())
-kindCheck n t = convertErrors asError $ runTypeCheckM n (kindOf t)
+kindCheck n t = convertErrors asError $ runTypeCheckM n False (kindOf t)
 
 -- | Run the type checker with a default context.
 runTypeCheckM :: (MonadError (TypeError a) m, MonadQuote m)
               => Natural -- ^ Amount of gas to provide typechecker
+              -> Bool -- ^ Should we normalize types?
               -> TypeCheckM a b
               -> m b
-runTypeCheckM i tc = do
+runTypeCheckM i b tc = do
     table <- defaultTable
-    liftEither $ fst <$> runReaderT (runStateT tc i) table
+    liftEither $ fst <$> runReaderT (runStateT tc i) (b, table)
 
 typeCheckStep :: TypeCheckM a ()
 typeCheckStep = do
@@ -149,7 +150,7 @@ kindOf (TyLam _ _ k ty) =
     [ KindArrow () (void k) k' | k' <- kindOf ty ]
 kindOf (TyVar _ (TyNameWithKind (TyName (Name (_, k) _ _)))) = pure (void k)
 kindOf (TyBuiltin _ b) = do
-    (BuiltinTable tyst _) <- ask
+    (_, BuiltinTable tyst _) <- ask
     case M.lookup b tyst of
         Just k -> pure k
         _      -> throwError InternalError
@@ -193,6 +194,10 @@ dummyKind = Type ()
 dummyType :: Type TyNameWithKind ()
 dummyType = TyVar () dummyTyName
 
+maybeReduce :: Bool -> Type TyNameWithKind a -> Type TyNameWithKind a
+maybeReduce False = id
+maybeReduce True  = tyReduce
+
 -- | Extract type of a term.
 typeOf :: Term TyNameWithKind NameWithType a -> TypeCheckM a (Type TyNameWithKind ())
 typeOf (Var _ (NameWithType (Name (_, ty) _ _))) = pure (void ty)
@@ -204,7 +209,7 @@ typeOf (Error x ty)                              = do
         _      -> throwError (KindMismatch x (void ty) (Type ()) k)
 typeOf (TyAbs _ n k t)                           = TyForall () (void n) (void k) <$> typeOf t
 typeOf (Constant _ (BuiltinName _ n)) = do
-    (BuiltinTable _ st) <- ask
+    (_, BuiltinTable _ st) <- ask
     case M.lookup n st of
         Just k -> pure k
         _      -> throwError InternalError
@@ -212,10 +217,11 @@ typeOf (Constant _ (BuiltinInt _ n _))           = pure (integerType n)
 typeOf (Constant _ (BuiltinBS _ n _))            = pure (bsType n)
 typeOf (Constant _ (BuiltinSize _ n))            = pure (sizeType n)
 typeOf (Apply x t t') = do
-    ty <- typeOf t
+    (red, _) <- ask
+    ty <- maybeReduce red <$> typeOf t
     case ty of
         TyFun _ ty' ty'' -> do
-            ty''' <- typeOf t'
+            ty''' <- maybeReduce red <$> typeOf t'
             typeCheckStep
             if ty' == ty'''
                 then pure ty''
